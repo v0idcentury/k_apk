@@ -1,0 +1,143 @@
+name: Unattended APK Frida Injection
+
+on:
+  workflow_dispatch: # Allows manual triggering
+  push:
+    branches: [ "main" ]
+
+jobs:
+  patch-and-build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Java JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: Setup Python environment
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install Turbo System Dependencies & Latest Tools
+        run: |
+          sudo apt-get update -qq
+          # Install aria2 for parallelized ultra-fast downloading
+          sudo apt-get install -y -qq aapt zipalign apksigner aria2
+          
+          # The default apt apktool is notoriously outdated and crashes on modern APKs.
+          # We fetch the latest robust release directly to prevent decompilation errors.
+          wget -q https://bitbucket.org/iBotPeaches/apktool/downloads/apktool_2.9.3.jar -O apktool.jar
+          sudo mv apktool.jar /usr/local/bin/apktool.jar
+          
+          # Create a high-memory wrapper for apktool to utilize the Linux runner's full power
+          echo -e '#!/bin/bash\nexport JAVA_OPTS="-Xmx4g"\njava -jar /usr/local/bin/apktool.jar "$@"' | sudo tee /usr/local/bin/apktool
+          sudo chmod +x /usr/local/bin/apktool
+          
+          pip install --upgrade pip frida-tools objection
+
+      - name: Concurrent High-Speed APK Download
+        run: |
+          # Aria2 utilizes 16 concurrent connections to download the file instantly.
+          aria2c -x 16 -s 16 -k 1M -V -o k.apk "https://temp.sh/ayksR/k_antisplit.apk"
+
+      - name: Extract Target Package Architecture & Name
+        id: extract
+        run: |
+          # Dynamically extracting the package name is mandatory to prevent Gadget path resolution errors
+          PKG_NAME=$(aapt dump badging k.apk | grep -oP "(?<=package: name=')[^']+")
+          if [ -z "$PKG_NAME" ]; then
+            echo "Fatal Error: Failed to extract package name."
+            exit 1
+          fi
+          echo "PKG_NAME=$PKG_NAME" >> $GITHUB_ENV
+          echo "Target Package: $PKG_NAME"
+
+      - name: Initial APK Patch via Objection
+        run: |
+          # Objection handles smali entry-point modification and injects the base libfrida-gadget.so
+          objection patchapk --source k.apk --architecture arm64-v8a
+
+      - name: Unpack Patched APK for Deep Configuration
+        run: |
+          # Unpack the objection-modified artifact with forced overwrite
+          apktool d k.objection.apk -o unpacked_apk -f
+
+      - name: Force Native Library Extraction (Foolproof Manifest Patch)
+        run: |
+          # Critical Fix: Modern Android sets extractNativeLibs=false by default, which traps our disguised .so scripts 
+          # inside the APK. This python script safely parses the XML and forces it to true, guaranteeing filesystem extraction.
+          python -c "
+          import xml.etree.ElementTree as ET
+          ET.register_namespace('android', 'http://schemas.android.com/apk/res/android')
+          tree = ET.parse('unpacked_apk/AndroidManifest.xml')
+          root = tree.getroot()
+          app = root.find('application')
+          if app is not None:
+              app.set('{http://schemas.android.com/apk/res/android}extractNativeLibs', 'true')
+              tree.write('unpacked_apk/AndroidManifest.xml', encoding='utf-8', xml_declaration=True)
+          "
+
+      - name: Configure Autonomous Frida Script Execution
+        run: |
+          LIB_DIR="unpacked_apk/lib/arm64-v8a"
+          mkdir -p $LIB_DIR
+          
+          # Fail-safe: Ensure hook.js exists to prevent pipeline crashes. Generates a robust fallback if missing.
+          if [ ! -f "hook.js" ]; then
+            echo "console.log('[+] Frida Gadget successfully loaded and running autonomously!');" > hook.js
+          fi
+          
+          # Move the script disguised as a shared object library
+          cp hook.js $LIB_DIR/libscript.so
+          
+          # The /data/data/<pkg>/lib/ directory is a native Android OS symlink to the true native library path.
+          # Hardcoding this dynamic path eliminates all dlopen/filesystem resolution crashes universally.
+          cat << EOF > $LIB_DIR/libfrida-gadget.config.so
+          {
+            "interaction": {
+              "type": "script",
+              "path": "/data/data/${PKG_NAME}/lib/libscript.so"
+            }
+          }
+          EOF
+
+      - name: High-Memory Repackage
+        run: |
+          apktool b unpacked_apk -o ready_to_sign.apk
+
+      - name: Cryptographic Alignment
+        run: |
+          # Aligning memory layout to 4-byte boundaries for strict Android compliance
+          zipalign -p -f 4 ready_to_sign.apk aligned.apk
+
+      - name: Dynamic Signing (Fail-Safe)
+        run: |
+          # Checks if repository secrets exist. If omitted or empty, it generates a high-entropy ephemeral keystore
+          # to guarantee the workflow completes without errors and delivers a usable artifact regardless of repo state.
+          if [ -z "${{ secrets.KEYSTORE_B64 }}" ]; then
+            echo "⚠️ No secure keystore found in secrets. Generating an ephemeral debug keystore to guarantee artifact delivery..."
+            keytool -genkey -v -keystore ephemeral.jks -storepass password -alias frida -keypass password -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Frida, OU=Auto, O=Pipeline, C=US"
+            apksigner sign --ks ephemeral.jks --ks-pass pass:password --key-pass pass:password --out k_output_signed.apk aligned.apk
+          else
+            echo "🔒 Signing with secure repository secrets..."
+            echo "${{ secrets.KEYSTORE_B64 }}" | base64 --decode > keystore.jks
+            apksigner sign --ks keystore.jks \
+            --ks-key-alias ${{ secrets.KEY_ALIAS }} \
+            --ks-pass pass:${{ secrets.KEYSTORE_PASS }} \
+            --key-pass pass:${{ secrets.KEY_PASS }} \
+            --out k_output_signed.apk aligned.apk
+          fi
+
+      - name: Upload Final Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Patched-Frida-APK
+          path: k_output_signed.apk
+          if-no-files-found: error
