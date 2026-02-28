@@ -5,21 +5,28 @@ on:
   push:
     branches: [ "main" ]
 
+# Cancel previous running jobs to save runner compute time
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   patch-and-build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read # Required for Objection Gadget fetching
 
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Setup Java JDK
+      - name: Setup Java JDK (Zulu 17)
         uses: actions/setup-java@v4
         with:
           distribution: 'zulu'
           java-version: '17'
 
-      - name: Setup Python environment
+      - name: Setup Python Environment
         uses: actions/setup-python@v4
         with:
           python-version: '3.10'
@@ -28,29 +35,170 @@ jobs:
       - name: Install Turbo System Dependencies & Latest Tools
         run: |
           sudo apt-get update -qq
-          # Install aria2 for parallelized ultra-fast downloading
-          sudo apt-get install -y -qq aapt zipalign apksigner aria2
+          sudo apt-get install -y -qq aapt zipalign apksigner aria2 jq xz-utils
           
-          # The default apt apktool is notoriously outdated and crashes on modern APKs.
-          # We fetch the latest robust release directly to prevent decompilation errors.
-          wget -q https://bitbucket.org/iBotPeaches/apktool/downloads/apktool_2.9.3.jar -O apktool.jar
+          # Fix for Exit Code 8: Bitbucket is dead. Dynamically fetch the latest stable release from GitHub.
+          APKTOOL_LATEST_URL=$(curl -s https://api.github.com/repos/iBotPeaches/Apktool/releases/latest | jq -r '.assets[] | select(.name | endswith(".jar")) | .browser_download_url')
+          curl -sL "$APKTOOL_LATEST_URL" -o apktool.jar
           sudo mv apktool.jar /usr/local/bin/apktool.jar
           
-          # Create a high-memory wrapper for apktool to utilize the Linux runner's full power
-          echo -e '#!/bin/bash\nexport JAVA_OPTS="-Xmx4g"\njava -jar /usr/local/bin/apktool.jar "$@"' | sudo tee /usr/local/bin/apktool
+          # Overclock the JVM to use 8GB RAM for maximum IO throughput
+          echo -e '#!/bin/bash\nexport JAVA_OPTS="-Xmx8g"\njava -jar /usr/local/bin/apktool.jar "$@"' | sudo tee /usr/local/bin/apktool
           sudo chmod +x /usr/local/bin/apktool
           
           pip install --upgrade pip frida-tools objection
 
       - name: Concurrent High-Speed APK Download
         run: |
-          # Aria2 utilizes 16 concurrent connections to download the file instantly.
+          # 16-thread simultaneous block downloading via aria2c for zero-latency retrieval
           aria2c -x 16 -s 16 -k 1M -V -o k.apk "https://temp.sh/ayksR/k_antisplit.apk"
+
+      - name: Construct Embedded Hook Payload
+        run: |
+          # Embedding the exact JavaScript matrix provided to ensure 100% presence without relying on external files
+          cat << 'EOF' > hook.js
+          /* Utilities */
+          var RANDOM = function() {};
+
+          function _randomInt(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
+          function _randomHex(len) {
+              var hex = '0123456789abcdef'; var output = '';
+              for (var i = 0; i < len; ++i) { output += hex.charAt(Math.floor(Math.random() * hex.length)); }
+              return output;
+          }
+          function _pad(n, width) { n = n + ""; return n.length >= width ? n : new Array(width - n.length + 1).join("0") + n; }
+          function _randomPaddedInt(length) { return _pad(_randomInt(0, Math.pow(10, length)), length); }
+          
+          function _luhn_getcheck(code) {
+              code = String(code).concat("0"); var len = code.length; var parity = len % 2; var sum = 0;
+              for (var i = len - 1; i >= 0; i--) {
+                  var d = parseInt(code.charAt(i));
+                  if (i % 2 == parity) { d *= 2; }
+                  if (d > 9) { d -= 9; }
+                  sum += d;
+              }
+              var checksum = sum % 10; return checksum == 0 ? 0 : 10 - checksum;
+          }
+
+          function _luhn_verify(code) {
+              code = String(code); var len = code.length; var parity = len % 2; var sum = 0;
+              for (var i = len - 1; i >= 0; i--) {
+                  var d = parseInt(code.charAt(i));
+                  if (i % 2 == parity) { d *= 2; }
+                  if (d > 9) { d -= 9; }
+                  sum += d;
+              }
+              return sum % 10 == 0;
+          }
+
+          /* Spoofing functions */
+          function spoofAndroidID(android_id) {
+              if (android_id == RANDOM) { android_id = _randomHex(16); } 
+              else if (android_id !== null) {
+                  android_id = String(android_id).toLowerCase();
+                  if (! android_id.match(/^[0-9a-f]{16}$/)) { throw new Error("Invalid Android ID value"); }
+              }
+              var ss = Java.use("android.provider.Settings$Secure");
+              ss.getString.overload("android.content.ContentResolver", "java.lang.String").implementation = function(context, param) {
+                  if (param == ss.ANDROID_ID.value) { return android_id; } 
+                  else { return this.getString(context, param); }
+              }
+          }
+
+          function spoofPhone(phone) {
+              if (phone === RANDOM) { phone = _randomPaddedInt(10); } 
+              else if (phone !== null) {
+                  phone = String(phone);
+                  if (! phone.match(/^[0-9]{1,15}$/)) { throw new Error("Invalid phone number"); }
+              }
+              var tm = Java.use("android.telephony.TelephonyManager");
+              tm.getLine1Number.overload().implementation = function() { return phone; }
+          }
+
+          function spoofIMEI(imei) {
+              if (imei === RANDOM) { imei = _randomPaddedInt(14); imei = imei.concat(_luhn_getcheck(imei)); } 
+              else if (imei !== null) {
+                  imei = String(imei);
+                  if (! imei.match(/^[0-9]{15}$/)) { throw new Error("Invalid IMEI value"); }
+                  if (! _luhn_verify(imei)) { console.warn("IMEI has an invalid check digit"); }
+              }
+              var tm = Java.use("android.telephony.TelephonyManager");
+              tm.getDeviceId.overload().implementation = function() { return imei; }
+              tm.getDeviceId.overload("int").implementation = function(slotIndex) { return imei; }
+              tm.getImei.overload().implementation = function() { return imei; }
+              tm.getImei.overload("int").implementation = function(slotIndex) { return imei; }
+          }
+
+          function spoofIMSI(imsi) {
+              if (imsi == RANDOM) { imsi = _randomPaddedInt(15); } 
+              else if (imsi !== null) {
+                  imsi = String(imsi);
+                  if (! imsi.match(/^[0-9]{14,15}$/)) { throw new Error("Invalid IMSI value"); }
+              }
+              var tm = Java.use("android.telephony.TelephonyManager");
+              tm.getSubscriberId.overload().implementation = function() { return imsi; }
+          }
+
+          function spoofICCID(iccid) {
+              if (iccid == RANDOM) { iccid = "89".concat(_randomPaddedInt(16)); iccid = iccid.concat(_luhn_getcheck(iccid)); } 
+              else if (iccid !== null) {
+                  iccid = String(iccid);
+                  if (! iccid.match(/^[0-9]{19,20}$/)) { throw new Error("Invalid ICCID value"); }
+                  if (! _luhn_verify(iccid)) { console.warn("ICCID has an invalid check digit"); }
+              }
+              var tm = Java.use("android.telephony.TelephonyManager");
+              tm.getSimSerialNumber.overload().implementation = function() { return iccid; }
+          }
+
+          function spoofMAC(mac) {
+              if (mac == RANDOM) {
+                  mac = [];
+                  for (var i = 0; i < 6; i++) { mac.push(_randomInt(0, 255)); }
+                  mac = Java.array("byte", mac);
+              } else if (mac !== null) {
+                  var mac_str = String(mac).toUpperCase();
+                  if (! mac_str.match(/^([0-9A-F]{2}:){5}[0-9A-F]{2}$/)) { throw new Error("Invalid MAC address value"); }
+                  mac = []; var mac_arr = mac_str.split(":");
+                  for (var i = 0; i < 6; i++) { mac.push(parseInt(mac_arr[i], 16)); }
+                  mac = Java.array("byte", mac);
+              }
+              var ni = Java.use("java.net.NetworkInterface");
+              ni.getHardwareAddress.overload().implementation = function() { return mac; }
+          }
+
+          function hideGSFID(gsf_id) {
+              var cr = Java.use("android.content.ContentResolver");
+              cr.query.overload("android.net.Uri", "[Ljava.lang.String;", "android.os.Bundle", "android.os.CancellationSignal").implementation = function(uri, projection, queryArgs, cancellationSignal) {
+                  var qres = this.query(uri, projection, queryArgs, cancellationSignal);
+                  if (uri.toString() == "content://com.google.android.gsf.gservices") { qres = null; }
+                  return qres;
+              }
+              cr.query.overload("android.net.Uri", "[Ljava.lang.String;", "java.lang.String", "[Ljava.lang.String;", "java.lang.String", "android.os.CancellationSignal").implementation = function(uri, projection, selection, selectionArgs, sortOrder, cancellationSignal) {
+                  var qres = this.query(uri, projection, selection, selectionArgs, sortOrder, cancellationSignal);
+                  if (uri.toString() == "content://com.google.android.gsf.gservices") { qres = null; }
+                  return qres;
+              }
+              cr.query.overload("android.net.Uri", "[Ljava.lang.String;", "java.lang.String", "[Ljava.lang.String;", "java.lang.String").implementation = function(uri, projection, selection, selectionArgs, sortOrder) {
+                  var qres = this.query(uri, projection, selection, selectionArgs, sortOrder);
+                  if (uri.toString() == "content://com.google.android.gsf.gservices") { qres = null; }
+                  return qres;
+              }
+          }
+
+          Java.perform(function () {
+              spoofMAC(RANDOM);
+              spoofICCID(RANDOM);
+              spoofIMSI("732101000000001");
+              spoofAndroidID(RANDOM);
+              spoofIMEI(RANDOM);
+              spoofPhone(RANDOM);
+              hideGSFID();
+          });
+          EOF
 
       - name: Extract Target Package Architecture & Name
         id: extract
         run: |
-          # Dynamically extracting the package name is mandatory to prevent Gadget path resolution errors
           PKG_NAME=$(aapt dump badging k.apk | grep -oP "(?<=package: name=')[^']+")
           if [ -z "$PKG_NAME" ]; then
             echo "Fatal Error: Failed to extract package name."
@@ -59,20 +207,20 @@ jobs:
           echo "PKG_NAME=$PKG_NAME" >> $GITHUB_ENV
           echo "Target Package: $PKG_NAME"
 
-      - name: Initial APK Patch via Objection
+      - name: Injection of Gadget Smali via Objection
+        env:
+          # Injects token so Objection doesn't get rate-limited when downloading the Frida gadget from GitHub
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Objection handles smali entry-point modification and injects the base libfrida-gadget.so
           objection patchapk --source k.apk --architecture arm64-v8a
 
       - name: Unpack Patched APK for Deep Configuration
         run: |
-          # Unpack the objection-modified artifact with forced overwrite
           apktool d k.objection.apk -o unpacked_apk -f
 
-      - name: Force Native Library Extraction (Foolproof Manifest Patch)
+      - name: Force Native Library Extraction (Manifest Patch)
         run: |
-          # Critical Fix: Modern Android sets extractNativeLibs=false by default, which traps our disguised .so scripts 
-          # inside the APK. This python script safely parses the XML and forces it to true, guaranteeing filesystem extraction.
+          # Ensures modern Android extracts our disguised hook.js (.so) to the accessible filesystem
           python -c "
           import xml.etree.ElementTree as ET
           ET.register_namespace('android', 'http://schemas.android.com/apk/res/android')
@@ -84,21 +232,15 @@ jobs:
               tree.write('unpacked_apk/AndroidManifest.xml', encoding='utf-8', xml_declaration=True)
           "
 
-      - name: Configure Autonomous Frida Script Execution
+      - name: Bind Autonomous Execution Logic
         run: |
           LIB_DIR="unpacked_apk/lib/arm64-v8a"
           mkdir -p $LIB_DIR
           
-          # Fail-safe: Ensure hook.js exists to prevent pipeline crashes. Generates a robust fallback if missing.
-          if [ ! -f "hook.js" ]; then
-            echo "console.log('[+] Frida Gadget successfully loaded and running autonomously!');" > hook.js
-          fi
-          
           # Move the script disguised as a shared object library
           cp hook.js $LIB_DIR/libscript.so
           
-          # The /data/data/<pkg>/lib/ directory is a native Android OS symlink to the true native library path.
-          # Hardcoding this dynamic path eliminates all dlopen/filesystem resolution crashes universally.
+          # Dynamically mapped path to bypass dlopen resolution crashes natively.
           cat << EOF > $LIB_DIR/libfrida-gadget.config.so
           {
             "interaction": {
@@ -108,34 +250,27 @@ jobs:
           }
           EOF
 
-      - name: High-Memory Repackage
+      - name: High-Memory Assembler Matrix
         run: |
           apktool b unpacked_apk -o ready_to_sign.apk
 
-      - name: Cryptographic Alignment
+      - name: Memory Page Alignment
         run: |
-          # Aligning memory layout to 4-byte boundaries for strict Android compliance
           zipalign -p -f 4 ready_to_sign.apk aligned.apk
 
       - name: Dynamic Signing (Fail-Safe)
         run: |
-          # Checks if repository secrets exist. If omitted or empty, it generates a high-entropy ephemeral keystore
-          # to guarantee the workflow completes without errors and delivers a usable artifact regardless of repo state.
           if [ -z "${{ secrets.KEYSTORE_B64 }}" ]; then
-            echo "⚠️ No secure keystore found in secrets. Generating an ephemeral debug keystore to guarantee artifact delivery..."
+            echo "⚠️ No secure keystore found. Generating ephemeral debug keystore..."
             keytool -genkey -v -keystore ephemeral.jks -storepass password -alias frida -keypass password -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Frida, OU=Auto, O=Pipeline, C=US"
             apksigner sign --ks ephemeral.jks --ks-pass pass:password --key-pass pass:password --out k_output_signed.apk aligned.apk
           else
-            echo "🔒 Signing with secure repository secrets..."
+            echo "🔒 Signing with repository secrets..."
             echo "${{ secrets.KEYSTORE_B64 }}" | base64 --decode > keystore.jks
-            apksigner sign --ks keystore.jks \
-            --ks-key-alias ${{ secrets.KEY_ALIAS }} \
-            --ks-pass pass:${{ secrets.KEYSTORE_PASS }} \
-            --key-pass pass:${{ secrets.KEY_PASS }} \
-            --out k_output_signed.apk aligned.apk
+            apksigner sign --ks keystore.jks --ks-key-alias ${{ secrets.KEY_ALIAS }} --ks-pass pass:${{ secrets.KEYSTORE_PASS }} --key-pass pass:${{ secrets.KEY_PASS }} --out k_output_signed.apk aligned.apk
           fi
 
-      - name: Upload Final Artifact
+      - name: Offload Telemetry / Artifact
         uses: actions/upload-artifact@v4
         with:
           name: Patched-Frida-APK
