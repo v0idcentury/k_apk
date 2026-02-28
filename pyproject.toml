@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "my-project"
+version = "0.1.0"
+description = "A simple example project"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {file = "LICENSE"}
+authors = [
+    {name = "Jane Doe", email = "jane@example.com"},
+]
+keywords = ["example", "project", "python"]
+dependencies = [
+    "requests>=2.25.0",
+    "pandas~=2.0.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "black", "mypy"]
+
+[project.urls]
+Homepage = "https://github.com"
+Documentation = "https://my-project.readthedocs.io"
+Repository = "https://github.com"
+
+[tool.black]
+line-length = 88
+include = ['\\.pyi$', '\\.py$']
